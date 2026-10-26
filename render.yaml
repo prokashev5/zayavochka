@@ -1,0 +1,20 @@
+# Render Blueprint: New → Blueprint → выбрать этот репозиторий.
+# Render спросит BOT_TOKEN и BOOKER_CHAT_ID; адрес сервиса придёт сам в RENDER_EXTERNAL_URL.
+services:
+  - type: web
+    name: zayavochka
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && pip install --no-deps -e .
+    # Ровно один процесс: FSM анкет живёт в памяти
+    startCommand: uvicorn zayavochka.app:create_app --factory --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_MODE
+        value: webhook
+      - key: VENUE_NAME
+        value: Клуб Гараж
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOOKER_CHAT_ID
+        sync: false

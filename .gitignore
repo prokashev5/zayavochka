@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+*.egg-info/
+dist/
+# Личные настройки Claude Code; агенты в .claude/agents коммитим
+.claude/settings.local.json
