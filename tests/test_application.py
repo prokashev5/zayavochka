@@ -98,3 +98,23 @@ class TestCard:
     def test_parse_applicant_id_missing(self):
         assert parse_applicant_id("просто текст") is None
         assert parse_applicant_id(None) is None
+
+
+class TestSettings:
+    @staticmethod
+    def make(**overrides):
+        from pydantic import SecretStr
+
+        from zayavochka.config import Settings
+
+        return Settings(_env_file=None, bot_token=SecretStr("123456:TEST-token"), bot_mode="off", **overrides)
+
+    def test_invite_link_instead_of_chat_id_explained(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="не ссылка"):
+            self.make(booker_chat_id="https://t.me/+xxxxxxxx")
+
+    @pytest.mark.parametrize(("raw", "expected"), [("", None), ("-1001234567890", -1001234567890)])
+    def test_chat_id_parsing(self, raw, expected):
+        assert self.make(booker_chat_id=raw).booker_chat_id == expected

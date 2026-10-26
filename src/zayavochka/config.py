@@ -41,8 +41,16 @@ class Settings(BaseSettings):
 
     @field_validator("booker_chat_id", mode="before")
     @classmethod
-    def _empty_chat_id_is_none(cls, value: object) -> object:
-        return None if value == "" else value
+    def _parse_chat_id(cls, value: object) -> object:
+        if value == "":
+            return None
+        if isinstance(value, str) and not value.strip().lstrip("-").isdigit():
+            # Частая ошибка — вставить ссылку-приглашение вместо id
+            raise ValueError(
+                "BOOKER_CHAT_ID — это число вида -1001234567890, а не ссылка. "
+                "Оставь его пустым, запусти бота и отправь /chat_id в группе букеров."
+            )
+        return value
 
     @field_validator("public_url")
     @classmethod
