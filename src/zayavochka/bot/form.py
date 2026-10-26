@@ -6,10 +6,11 @@
 
 import logging
 import time
+from contextlib import suppress
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -41,7 +42,16 @@ logger = logging.getLogger(__name__)
 
 # Не чаще одной заявки от человека за это время (в памяти: после рестарта сбрасывается — ок)
 SUBMIT_COOLDOWN_SECONDS = 10 * 60
+# Ответы на уточнения площадки — не чаще раза в минуту, чтобы не заспамить чат букеров
+REPLY_COOLDOWN_SECONDS = 60
 TOTAL_STEPS = len(QUESTIONS) + 1  # + шаг с райдером
+
+
+def _has_button(message: Message, data: str | None) -> bool:
+    markup = message.reply_markup
+    if markup is None or data is None:
+        return False
+    return any(button.callback_data == data for row in markup.inline_keyboard for button in row)
 
 
 class Form(StatesGroup):
@@ -150,8 +160,14 @@ def create_form_router() -> Router:
     @router.callback_query(Preview.filter(F.action == "restart"))
     async def restart(callback: CallbackQuery, state: FSMContext, settings: Settings) -> None:
         await callback.answer()
-        await callback.message.edit_reply_markup(reply_markup=None)
+        with suppress(TelegramBadRequest):  # двойной тап: кнопки уже убраны
+            await callback.message.edit_reply_markup(reply_markup=None)
         await _start_form(callback.message, state, settings)
+
+    @router.message(Form.preview)
+    async def preview_hint(message: Message) -> None:
+        # Клавиатуры анкеты здесь уже нет; /start сбросил бы заполненную заявку
+        await message.answer("Нажми «✅ Отправить» или «🔄 Заново» под заявкой выше.")
 
     @router.callback_query(Preview.filter(F.action == "send"))
     async def send(
@@ -189,11 +205,6 @@ def create_form_router() -> Router:
             card = await bot.send_message(
                 settings.booker_chat_id, **card_text.as_kwargs(), reply_markup=decision_keyboard(user.id)
             )
-            if rider_id:
-                await bot.send_document(
-                    settings.booker_chat_id, document=rider_id,
-                    reply_parameters=ReplyParameters(message_id=card.message_id),
-                )
         except TelegramAPIError:
             # Чат удалён, бот выгнан, группа стала супергруппой (сменился id) — env устарел
             logger.exception("Не удалось доставить заявку в чат букеров %s", settings.booker_chat_id)
@@ -203,32 +214,75 @@ def create_form_router() -> Router:
             await callback.message.answer("Не получилось доставить заявку площадке. Нажми «Отправить» ещё раз чуть позже.")
             return
 
-        await callback.message.edit_reply_markup(reply_markup=None)
+        # Карточка уже у букеров: сбой райдера — не повод слать заявку повторно (будет дубль)
+        if rider_id:
+            try:
+                await bot.send_document(
+                    settings.booker_chat_id, document=rider_id,
+                    reply_parameters=ReplyParameters(message_id=card.message_id),
+                )
+            except TelegramAPIError:
+                logger.exception("Райдер не прикрепился к заявке %s", card.message_id)
+                with suppress(TelegramAPIError):
+                    await bot.send_message(
+                        settings.booker_chat_id, "⚠️ Райдер к этой заявке не прикрепился — попросите прислать заново.",
+                        reply_parameters=ReplyParameters(message_id=card.message_id),
+                    )
+                await callback.message.answer("Заявка ушла, но райдер не прикрепился — площадка может попросить его отдельно.")
+
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(
             f"🎉 Заявка отправлена в «{settings.venue_name}»! Ответ площадки придёт сюда. "
             "Новую заявку можно подать через /start."
         )
 
     @router.callback_query(Reply.filter())
-    async def start_reply(callback: CallbackQuery, callback_data: Reply, state: FSMContext) -> None:
+    async def start_reply(
+        callback: CallbackQuery, callback_data: Reply, state: FSMContext, bot: Bot,
+        reply_cooldowns: dict[int, float],
+    ) -> None:
+        # callback_data присылает клиент: принимаем только кнопку, которую бот сам повесил на свой вопрос
+        message = callback.message
+        if message is None or message.from_user is None or message.from_user.id != bot.id or not _has_button(message, callback.data):
+            await callback.answer("Эта кнопка недействительна.", show_alert=True)
+            return
+        if await state.get_state() in (Form.answering, Form.rider, Form.preview):
+            await callback.answer("Сначала отправь или отмени заявку, которую заполняешь.", show_alert=True)
+            return
+        last = reply_cooldowns.get(callback.from_user.id)
+        if last is not None and time.monotonic() - last < REPLY_COOLDOWN_SECONDS:
+            await callback.answer("Подожди минуту перед следующим ответом.", show_alert=True)
+            return
         await state.set_state(Form.replying)
         await state.update_data(card=callback_data.card)
         await callback.answer()
-        await callback.message.answer("Напиши ответ одним сообщением — перешлю площадке.", reply_markup=REMOVE)
+        await message.answer("Напиши ответ одним сообщением — перешлю площадке.", reply_markup=REMOVE)
 
     @router.message(Form.replying)
-    async def send_reply(message: Message, state: FSMContext, bot: Bot, settings: Settings) -> None:
+    async def send_reply(
+        message: Message, state: FSMContext, bot: Bot, settings: Settings, reply_cooldowns: dict[int, float]
+    ) -> None:
         data = await state.get_data()
         await state.clear()
+        user = message.from_user
+        reply_to = ReplyParameters(message_id=data["card"], allow_sending_without_reply=True)
         try:
+            # Подпись: даже если карточку удалили, видно, чей это ответ
+            await bot.send_message(
+                settings.booker_chat_id,
+                f"💬 Ответ группы от {user.full_name}\nID заявителя: {user.id}",
+                reply_parameters=reply_to,
+            )
             await bot.copy_message(
                 settings.booker_chat_id, from_chat_id=message.chat.id, message_id=message.message_id,
-                reply_parameters=ReplyParameters(message_id=data["card"], allow_sending_without_reply=True),
+                reply_parameters=reply_to,
             )
         except TelegramAPIError:
             logger.exception("Не удалось переслать ответ группы букерам")
             await message.answer("Не получилось переслать ответ. Нажми «Ответить площадке» ещё раз.")
             return
+        reply_cooldowns[user.id] = time.monotonic()
         await message.answer("✅ Ответ отправлен площадке.")
 
     @router.message()

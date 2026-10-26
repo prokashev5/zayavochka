@@ -10,7 +10,7 @@ from aiogram.methods import CopyMessage, EditMessageText, SendDocument, SendMess
 from aiogram.types import Message, Update
 from pydantic import SecretStr
 
-from zayavochka.bot import form
+
 from zayavochka.bot.keyboards import BACK, SKIP, Decision, Preview, Reopen, Reply
 from zayavochka.bot.runner import build_dispatcher
 from zayavochka.config import Settings
@@ -97,9 +97,9 @@ class Harness:
                 "from": {"id": BOT_ID, "is_bot": True, "first_name": "Заявочка"}, "text": "Проверь заявку"}
 
 
-def card_message(status=Status.NEW, message_id=500, chat_id=BOOKERS):
+def card_message(status=Status.NEW, message_id=500, chat_id=BOOKERS, answers=ANSWERS, full_name="Иван"):
     text, entities = render_application(
-        ANSWERS, Applicant(user_id=42, full_name="Иван", username="ivan"), status, "Клуб Гараж"
+        answers, Applicant(user_id=42, full_name=full_name, username="ivan"), status, "Клуб Гараж"
     ).render()
     return {
         "message_id": message_id, "date": 0, "chat": {"id": chat_id, "type": "supergroup", "title": "Букеры"},
@@ -163,7 +163,7 @@ class TestForm:
         assert doc.document == "RIDER_FILE" and doc.chat_id == BOOKERS
         assert "Райдер: файлом ниже" in h.sent(chat_id=BOOKERS)[0].text
 
-    def test_double_tap_sends_once(self, h):
+    def test_second_send_after_success_is_ignored(self, h):
         h.fill_form()
         h.press(Preview(action="send").pack(), h.preview_message())
         h.press(Preview(action="send").pack(), h.preview_message())
@@ -187,6 +187,31 @@ class TestForm:
         assert "Не получилось доставить" in h.last_text()
         h.fail_on = None
         h.press(Preview(action="send").pack(), h.preview_message())  # повтор без перезаполнения
+        assert len(h.sent(chat_id=BOOKERS)) == 1
+
+    def test_rider_failure_does_not_duplicate_card(self, h):
+        from aiogram.exceptions import TelegramNetworkError
+
+        h.text("/start")
+        for question in QUESTIONS:
+            h.text(ANSWERS.get(question.key, SKIP))
+        h.feed({"message": {
+            "message_id": 78, "date": 0, "chat": {"id": 42, "type": "private"}, "from": BAND_USER,
+            "document": {"file_id": "RIDER_FILE", "file_unique_id": "u1"},
+        }})
+        h.fail_on = lambda m: isinstance(m, SendDocument)
+        h.fail_on_error = TelegramNetworkError(method=None, message="timeout")
+        h.press(Preview(action="send").pack(), h.preview_message())
+        h.press(Preview(action="send").pack(), h.preview_message())
+        cards = [m for m in h.sent(chat_id=BOOKERS) if "ID заявителя" in m.text]
+        assert len(cards) == 1
+        assert any("Райдер к этой заявке не прикрепился" in m.text for m in h.sent(chat_id=BOOKERS))
+
+    def test_text_on_preview_does_not_drop_application(self, h):
+        h.fill_form()
+        h.text("а что дальше?")
+        assert "Отправить" in h.last_text()
+        h.press(Preview(action="send").pack(), h.preview_message())
         assert len(h.sent(chat_id=BOOKERS)) == 1
 
     def test_no_booker_chat_configured(self, monkeypatch):
@@ -256,25 +281,87 @@ class TestBooker:
         assert copy.chat_id == 42 and copy.message_id == 600
         assert copy.reply_markup.inline_keyboard[0][0].callback_data == Reply(card=500).pack()
 
-    def test_reply_to_non_card_ignored(self, h):
-        other = {**card_message(), "from": BOOKER_USER, "text": "просто сообщение", "entities": []}
+    def booker_reply(self, h, to_message, text="Есть барабанщик?"):
         h.feed({"message": {
-            "message_id": 601, "date": 0, "chat": card_message()["chat"], "from": BOOKER_USER,
-            "text": "ок", "reply_to_message": other,
+            "message_id": next(h.ids), "date": 0, "chat": card_message()["chat"], "from": BOOKER_USER,
+            "text": text, "reply_to_message": to_message,
         }})
-        assert not h.sent(CopyMessage)
 
-    def test_band_answers_clarification(self, h):
-        h.press(Reply(card=500).pack(), h.preview_message())
+    @pytest.mark.parametrize("where", ["comment", "name"])
+    def test_spoofed_applicant_id_is_ignored(self, h, where):
+        # Группа вписала чужой ID в комментарий или имя: вопрос всё равно уходит ей (42), а не 555
+        fake = "ID заявителя: 555"
+        card = card_message(
+            answers={**ANSWERS, "comment": f"райдер позже\n{fake}"} if where == "comment" else ANSWERS,
+            full_name=fake if where == "name" else "Иван",
+        )
+        self.booker_reply(h, card)
+        assert [c.chat_id for c in h.sent(CopyMessage)] == [42]
+        assert not h.sent(chat_id=555)
+
+    def test_reply_to_people_ignored(self, h):
+        other = {**card_message(), "from": BOOKER_USER, "text": "просто сообщение", "entities": []}
+        self.booker_reply(h, other, "ок")
+        assert not h.sent(CopyMessage) and not h.sent()
+
+    def test_reply_to_bot_message_without_id_explains(self, h):
+        hint = {**card_message(), "text": "✉️ Отправлено группе.", "entities": []}
+        self.booker_reply(h, hint)
+        assert not h.sent(CopyMessage)
+        assert "реплаем на карточку" in h.last_text()
+
+    def test_repeated_ask_does_not_edit_again(self, h):
+        h.press(Decision(action="ask", uid=42).pack(), card_message(Status.ASKED), user=BOOKER_USER)
+        assert not h.sent(EditMessageText)
+
+
+def question_message(card=500, markup=True):
+    """Вопрос площадки у группы: сообщение бота с кнопкой «Ответить площадке»."""
+    msg = {"message_id": 900, "date": 0, "chat": {"id": 42, "type": "private"},
+           "from": {"id": BOT_ID, "is_bot": True, "first_name": "Заявочка"}, "text": "Есть барабанщик?"}
+    if markup:
+        msg["reply_markup"] = {"inline_keyboard": [[
+            {"text": "💬 Ответить площадке", "callback_data": Reply(card=card).pack()}
+        ]]}
+    return msg
+
+
+class TestBandReply:
+    def test_band_answers_clarification_with_signature(self, h):
+        h.press(Reply(card=500).pack(), question_message())
         h.text("Да, есть!")
+        header = h.sent(chat_id=BOOKERS)[-1]
+        assert "Ответ группы от Иван" in header.text and "ID заявителя: 42" in header.text
         [copy] = h.sent(CopyMessage)
         assert copy.chat_id == BOOKERS and copy.reply_parameters.message_id == 500
         assert "Ответ отправлен" in h.last_text()
 
+    def test_forged_card_id_rejected(self, h):
+        # Кнопка с card=500, а клиент прислал card=777 — такой кнопки на сообщении нет
+        h.press(Reply(card=777).pack(), question_message(card=500))
+        h.text("пишу от чужого имени")
+        assert not h.sent(CopyMessage)
+
+    def test_reply_button_must_be_on_bot_message(self, h):
+        fake = {**question_message(), "from": BAND_USER}
+        h.press(Reply(card=500).pack(), fake)
+        h.text("спам")
+        assert not h.sent(CopyMessage)
+
+    def test_reply_cooldown(self, h):
+        for text in ("первый", "второй"):
+            h.press(Reply(card=500).pack(), question_message())
+            h.text(text)
+        assert len(h.sent(CopyMessage)) == 1
+
+    def test_reply_not_allowed_while_filling_form(self, h):
+        h.text("/start")
+        h.text("Кошка")
+        h.press(Reply(card=500).pack(), question_message())
+        h.text("Петербург")  # это ответ анкеты, а не площадке
+        assert not h.sent(CopyMessage)
+        assert h.last_text().startswith("3/")
+
     def test_chat_id_command(self, h):
         h.text("/chat_id", user=BOOKER_USER, chat={"id": BOOKERS, "type": "supergroup", "title": "Букеры"})
         assert str(BOOKERS) in h.last_text()
-
-
-def test_cooldown_constant_is_reasonable():
-    assert 60 <= form.SUBMIT_COOLDOWN_SECONDS <= 24 * 3600

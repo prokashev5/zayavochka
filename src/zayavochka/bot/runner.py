@@ -50,7 +50,7 @@ class DropDuplicates(BaseMiddleware):
 
 def build_dispatcher(settings: Settings) -> Dispatcher:
     # Именованные аргументы диспетчера доступны хендлерам как параметры (settings, cooldowns)
-    dp = Dispatcher(settings=settings, cooldowns={})
+    dp = Dispatcher(settings=settings, cooldowns={}, reply_cooldowns={})
     dp.update.outer_middleware(DropDuplicates())
     # Букерский роутер первым: /chat_id должен работать и в личке, до общего «нажми /start»
     dp.include_router(create_booker_router(settings))

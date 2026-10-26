@@ -8,9 +8,10 @@ import asyncio
 import html
 import logging
 import re
+from contextlib import suppress
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
@@ -76,15 +77,19 @@ def create_booker_router(settings: Settings) -> Router:
             await callback.answer("Нет доступа.", show_alert=True)
             return
         card = callback.message
-        lock = locks.setdefault(card.message_id, asyncio.Lock())
-        if lock.locked():
-            await callback.answer("Другой букер уже решает эту заявку.", show_alert=True)
-            return
+        # «Решено» проверяем до создания замка: иначе каждое нажатие оставляло бы замок в памяти
         if card.message_id in decided:
             await callback.answer("Решение уже принято. Чтобы поменять — «Изменить решение».", show_alert=True)
             return
         status = STATUS_BY_ACTION[callback_data.action]
         final = status is not Status.ASKED
+        if not final and Status.ASKED.value in (card.text or "").partition("\n")[0]:
+            await callback.answer("Уже ждём ответа группы — ответьте реплаем на заявку.")
+            return
+        lock = locks.setdefault(card.message_id, asyncio.Lock())
+        if lock.locked():
+            await callback.answer("Другой букер уже решает эту заявку.", show_alert=True)
+            return
         keyboard = reopen_keyboard(callback_data.uid) if final else decision_keyboard(callback_data.uid)
         try:
             async with lock:
@@ -123,15 +128,20 @@ def create_booker_router(settings: Settings) -> Router:
             await callback.answer("Нет доступа.", show_alert=True)
             return
         decided.discard(callback.message.message_id)
-        await callback.message.edit_reply_markup(reply_markup=decision_keyboard(callback_data.uid))
         await callback.answer("Выберите новое решение.")
+        with suppress(TelegramBadRequest):  # двойной тап: кнопки уже такие
+            await callback.message.edit_reply_markup(reply_markup=decision_keyboard(callback_data.uid))
 
     @router.message(F.reply_to_message, F.chat.func(lambda chat: in_booker_chat(chat.id)))
     async def ask_band(message: Message, bot: Bot) -> None:
         card = message.reply_to_message
+        if card.from_user is None or card.from_user.id != bot.id:
+            return  # обычный разговор букеров между собой
         uid = parse_applicant_id(card.text)
-        if card.from_user is None or card.from_user.id != bot.id or uid is None:
-            return  # обычный reply в рабочем чате, не на заявку
+        if uid is None:
+            # Реплай на служебное сообщение бота: молчать нельзя — букер решит, что вопрос ушёл
+            await message.reply("Чтобы написать группе, ответьте реплаем на карточку заявки или на подпись «💬 Ответ группы».")
+            return
         band = band_of(card.text)
         try:
             await bot.send_message(uid, f"❓ Вопрос от «{settings.venue_name}» по заявке «{band}»:")

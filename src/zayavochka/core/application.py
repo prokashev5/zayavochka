@@ -12,7 +12,8 @@ from aiogram.utils.formatting import Bold, Text, TextLink, as_key_value, as_line
 
 MAX_MESSAGE = 4096  # лимит Telegram на текст сообщения
 URL_RE = re.compile(r"(https?://|t\.me/|vk\.com/)\S+", re.IGNORECASE)
-APPLICANT_ID_RE = re.compile(r"ID заявителя: (\d+)")
+# Строка целиком: ответы анкеты и имя Telegram стоят выше и могут содержать подделку
+APPLICANT_ID_RE = re.compile(r"^ID заявителя: (\d+)$", re.MULTILINE)
 
 
 class AnswerError(ValueError):
@@ -108,8 +109,10 @@ def render_application(
 
 
 def parse_applicant_id(card_text: str | None) -> int | None:
-    match = APPLICANT_ID_RE.search(card_text or "")
-    return int(match[1]) if match else None
+    """id группы из карточки. Берём ПОСЛЕДНЕЕ совпадение: настоящая строка идёт после
+    всех ответов анкеты, а в комментарий или имя можно вписать «ID заявителя: 555»."""
+    matches = APPLICANT_ID_RE.findall(card_text or "")
+    return int(matches[-1]) if matches else None
 
 
 def preview_for_applicant(answers: dict[str, str], has_rider: bool) -> Text:
